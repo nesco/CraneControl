@@ -10,7 +10,7 @@ A two-part system:
 ## Quick start
 ```bash
 # backend
-cd backend && uvicorn main:app --reload
+cd backend && uv venv .venv --python 3.12 && source .venv/bin/activate && uv sync && uv run uvicorn crane_server:app --reload
 # frontend
 cd frontend && npm install && npm run dev
 
