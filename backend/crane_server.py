@@ -18,6 +18,14 @@ MAX_SPEED = {  # units / s
     "wristDeg": 180,
     "gripMm": 200,
 }
+
+MAX_SPEED |= {
+    "xM": 1.0,
+    "yM": 1.0,
+    "zM": 1.0,
+    "yawDeg": 90.0,
+}
+
 MAX_ACCEL = {k: v * 3 for k, v in MAX_SPEED.items()}  # simple rule
 
 ELBOW_LEN = 0.75
@@ -28,17 +36,43 @@ MIN_LIFT_MM = 200
 MAX_LIFT_MM = 3000
 
 DROPBOX_H = 0.12
-ELBOW_W = PIVOT_W * 4/5
-WRIST_W = ELBOW_W * 4/5
+ELBOW_W = PIVOT_W * 4 / 5
+WRIST_W = ELBOW_W * 4 / 5
+
+ELBOW_DIST = PIVOT_W + ELBOW_LEN
+
+JOINT_KEYS = {"swingDeg", "liftMm", "elbowDeg", "wristDeg", "gripMm"}
+
+HYSTERESIS_DEG = 8.0  # only switch branch if it's this many degrees better
+BLEND_DIST_MM = 20.0  # only allow switch when within 20 mm of target
+
 
 ## Crane State
+class RootPose(BaseModel):
+    xM: float = 0.0
+    yM: float = 0.0
+    zM: float = 0.0
+    yawDeg: float = 0.0
 
-class CraneState(BaseModel):
+
+class CraneState(RootPose):
     swingDeg: float
     liftMm: float
     elbowDeg: float
     wristDeg: float
     gripMm: float = 70
+
+
+## IK Context
+
+
+class IKContext:
+    def __init__(self):
+        # +1 = elbow-down branch, −1 = elbow-up branch
+        self.elbow_sign = +1
+        # last joint angles (deg)
+        self.swing_prev = 0.0
+        self.elbow_prev = 0.0
 
 
 ## App
@@ -62,72 +96,185 @@ clients: set[WebSocket] = set()  # every connected front-end
 
 targets = state.model_dump()  # current goals = current positions
 vel = {k: 0.0 for k in MAX_SPEED}
+integrals = {k: 0.0 for k in MAX_SPEED}
+Kp, Ki = 3.0, 0.3  # tune these
 
+hold_xyz_mm: tuple[float, float, float] | None = None
+ik_ctx = IKContext()
 
 ## Helpers
+
 
 def wrap180(a_deg: float) -> float:
     """Shortest signed angle difference in (-180, 180] deg."""
     return (a_deg + 180.0) % 360.0 - 180.0
 
 
-def ik_xyz_to_joints(
-    x_mm: float,
-    y_mm: float,
-    z_mm: float,
-) -> dict[str, float]:
-    """
-    Analytic 2-R IK (base-swing + elbow) for a crane whose vertical motion
-    is produced **only** by the prismatic lift.
-    The function returns whichever inverse branch needs the smallest
-    change in base swing from the current pose.
-    """
+def angle_diff(a: float, b: float) -> float:
+    """Calculate the shortest distance between two angles in degrees.
+    Returns the signed difference in the range [-180, 180]."""
+    diff = (a - b) % 360.0
+    if diff > 180.0:
+        diff -= 360.0
+    return diff
 
-    # 1 ── metric units and planar reduction ────────────────────────────
-    x, z = x_mm / 1000.0, z_mm / 1000.0          # m
-    theta1 = math.atan2(z, x)                    # rad, candidate swing
-    r = math.hypot(x, z) - PIVOT_W               # horizontal reach
 
-    # 2 ── workspace check (purely planar) ──────────────────────────────
-    r_min = abs(ELBOW_LEN - WRIST_LEN)
-    r_max = ELBOW_LEN + WRIST_LEN
-    if not r_min <= r <= r_max:
-        print("Target out of reach in the X-Z plane")
-        r = min(max(r, r_min), r_max)
+def clamp(min_val: float, max_val: float, value: float) -> float:
+    return min(max_val, max(min_val, value))
 
-    # 3 ── elbow magnitude (law of cosines, planar) ─────────────────────
-    cos_el = (r*r - ELBOW_LEN**2 - WRIST_LEN**2) / (2*ELBOW_LEN*WRIST_LEN)
-    theta2_mag = math.acos(cos_el)               # ≥ 0, rad
-    pos_bend = x - WRIST_LEN*math.cos(theta2_mag), z - WRIST_LEN*math.sin(theta2_mag)
-    neg_bend = x - WRIST_LEN*math.cos(theta2_mag), z + WRIST_LEN*math.sin(theta2_mag)
-    print(f"theta1: {math.degrees(theta1)}, theta2: {math.degrees(theta2_mag)}")
 
-    # 4 ── produce the two inverse branches ─────────────────────────────
-    branches = [
-        {   # elbow-down (positive bend)
-            "swingDeg": math.degrees(math.atan2(pos_bend[1], pos_bend[0])),
-            "elbowDeg":  math.degrees(+theta2_mag),
+def planar_2R_ik(
+    x: float, z: float, l1: float, l2: float
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    r2 = x * x + z * z
+    r = math.sqrt(r2)
+
+    # Clamping if needed
+
+    r_max = l1 + l2
+    r_min = abs(l1 - l2)
+
+    if r > r_max:
+        x *= r_max / r
+        z *= r_max / r
+        r = r_max
+        r2 = r * r
+    elif r < r_min:
+        if r < 1e-9:  # target was almost exactly at the elbow origin
+            x, z = r_min, 0
+        else:
+            x *= r_min / r
+            z *= r_min / r
+        r = r_min
+        r2 = r * r
+
+    # Cosine law
+    cos_el = (r2 - l1 * l1 - l2 * l2) / (2 * l1 * l2)
+    cos_el = clamp(-1.0, 1.0, cos_el)
+    θ2_mag = math.acos(cos_el)
+
+    cos_al = (l1 * l1 + r2 - l2 * l2) / (2 * l1 * r)
+    cos_al = max(-1.0, min(1.0, cos_al))
+    α = math.acos(cos_al)
+    φ = math.atan2(z, x)
+
+    # elbow-down / elbow-up
+    return ((φ - α, +θ2_mag), (φ + α, -θ2_mag))
+
+
+def proportional_control(
+    key: str, target: float, dt: float, current_state: dict
+) -> float:
+    error = target - current_state[key]
+    integrals[key] += error * dt
+    cmd = Kp * error + Ki * integrals[key]
+    # Compute required speed
+    speed = clamp(-MAX_SPEED[key], MAX_SPEED[key], cmd)
+
+    # Check acceleration limit
+    dv = speed - vel[key]
+    max_dv = MAX_ACCEL[key] * dt
+
+    if abs(dv) > max_dv:
+        speed = vel[key] + max_dv * (1 if dv > 0 else -1)
+
+    return speed
+
+
+def joints_to_xz(current_state: CraneState):
+    swing = math.radians(current_state.swingDeg)
+    elbow = math.radians(current_state.elbowDeg)
+    yaw = math.radians(current_state.yawDeg)
+
+    lx = ELBOW_DIST * math.cos(swing) + WRIST_LEN * math.cos(swing + elbow)
+    lz = ELBOW_DIST * math.sin(swing) + WRIST_LEN * math.sin(swing + elbow)
+
+    dx = lx * math.cos(yaw) - lz * math.sin(yaw)
+    dz = lx * math.sin(yaw) + lz * math.cos(yaw)
+
+    x = dx + current_state.xM
+    z = dz + current_state.zM
+
+    return x, z
+
+
+def world_xyz_to_joints(x_mm, y_mm, z_mm, current_state: CraneState):
+    global ik_ctx
+    # 1 - Translate global coordinates into the local origin of the crane
+    dx = x_mm / 1000 - current_state.xM
+    dy = y_mm / 1000 - current_state.yM
+    dz = -(z_mm / 1000 - current_state.zM)
+
+    # 2 - Translate into the frame of the crane
+    yaw = math.radians(current_state.yawDeg)
+    cy = math.cos(-yaw)
+    sy = math.sin(-yaw)
+    lx = dx * cy - dz * sy  # local +X (forward)
+    lz = dx * sy + dz * cy  # local +Z (left)
+
+    (θ1_dn, θ2_dn), (θ1_up, θ2_up) = planar_2R_ik(lx, lz, l1=ELBOW_DIST, l2=WRIST_LEN)
+
+    # 4 ── pick the branch closest to current swing
+    cand = [
+        {
+            "sign": 1,
+            "swingDeg": wrap180(math.degrees(θ1_dn)),
+            "elbowDeg": wrap180(math.degrees(θ2_dn)),
         },
-        {   # elbow-up (negative bend)
-            "swingDeg": math.degrees(math.atan2(neg_bend[1], neg_bend[0])),
-            "elbowDeg":  math.degrees(-theta2_mag),
+        {
+            "sign": -1,
+            "swingDeg": wrap180(math.degrees(θ1_up)),
+            "elbowDeg": wrap180(math.degrees(θ2_up)),
         },
     ]
 
-    # 5 ── choose the one that disturbs swing the least ─────────────────
-    best = min(
-        branches,
-        key=lambda b: abs(wrap180(b["swingDeg"] - state.swingDeg))
+    # 5 ── cost = joint‐space change from last frame
+    def cost(sol):
+        ds = angle_diff(sol["swingDeg"], ik_ctx.swing_prev)
+        de = angle_diff(sol["elbowDeg"], ik_ctx.elbow_prev)
+        return math.hypot(ds, de)
+
+    for s in cand:
+        s["cost"] = cost(s)
+
+    best = min(cand, key=lambda s: s["cost"])
+    current = next(s for s in cand if s["sign"] == ik_ctx.elbow_sign)
+
+    # 6 ── hysteresis + proximity check before switching
+    if best["sign"] != current["sign"]:
+        if (best["cost"] + HYSTERESIS_DEG) < current["cost"]:
+            # only if elbow is already near the Cartesian target
+            # compute FK to see distance to goal:
+            x_fk, z_fk = joints_to_xz(
+                CraneState(
+                    **{
+                        **current_state.model_dump(),
+                        "swingDeg": best["swingDeg"],
+                        "elbowDeg": best["elbowDeg"],
+                    }
+                )
+            )
+            dist = math.hypot(x_fk * 1000 - x_mm, z_fk * 1000 - z_mm)
+            if dist < BLEND_DIST_MM:
+                ik_ctx.elbow_sign = best["sign"]
+                current = best
+
+    # 7 ── commit this branch
+    ik_ctx.swing_prev = current["swingDeg"]
+    ik_ctx.elbow_prev = current["elbowDeg"]
+
+    # 8 ── cope with lift & bookkeeping
+    best["liftMm"] = clamp(
+        MIN_LIFT_MM, MAX_LIFT_MM, y_mm + DROPBOX_H + WRIST_W + ELBOW_W
     )
-    print(f"swing deg: { best["swingDeg"]} elbow deg: {best["elbowDeg"]} total: {best["swingDeg"] + best["elbowDeg"]} ")
 
-    # 6 ── clamp lift (lift is the *only* source of Y motion) ───────────
-    best["liftMm"] = max(MIN_LIFT_MM, min(MAX_LIFT_MM, y_mm))
-
-    # wrap swing into 0…360 for the renderer / controller
-    best["swingDeg"] %= 360.0
+    del best["cost"]
+    del best["sign"]
 
     return best
+
+
+# --- Make sure world_xyz_to_joints calls the corrected function ---
 
 ### Async functions
 
@@ -146,6 +293,7 @@ async def broadcaster():
 
 
 async def motion_loop():
+    global hold_xyz_mm, state
     last = time.perf_counter()
     while True:
         await asyncio.sleep(REFRESH_DELAY)
@@ -153,21 +301,19 @@ async def motion_loop():
         last = now
         async with state_lock:
             cur = state.model_dump()
+            # Control loop
             for k, tgt in targets.items():
-                err = tgt - cur[k]
-                # desired speed limited by position error and max speed
-                spd = max(-MAX_SPEED[k], min(MAX_SPEED[k], err / max(dt, 1e-4)))
-                # acceleration limit
-                dv = spd - vel[k]
-                max_dv = MAX_ACCEL[k] * dt
-                if abs(dv) > max_dv:
-                    spd = vel[k] + max_dv * (1 if dv > 0 else -1)
-                vel[k] = spd
+                vel[k] = proportional_control(k, tgt, dt, cur)
                 cur[k] += vel[k] * dt
+            if hold_xyz_mm is not None:
+                # recompute joint targets every tick so that EE ≈ hold_xyz in world
+                jt = world_xyz_to_joints(*hold_xyz_mm, current_state=CraneState(**cur))
+                targets.update(jt)
             globals()["state"] = CraneState(**cur)
 
 
 async def demo_motion():
+    global state
     """Drive the same sine-wave animation that was in React."""
     t0 = time.perf_counter()
     while True:
@@ -179,14 +325,29 @@ async def demo_motion():
             "wristDeg": -100 * math.sin(t),
         }
         async with state_lock:
-            global state
             state = state.model_copy(update=new_vals)  # Pydantic 2.x partial update
+
+
+async def spin_origin(r=1.0, period=60.0):
+    t0 = time.perf_counter()
+    while True:
+        await asyncio.sleep(REFRESH_DELAY)
+        t = (time.perf_counter() - t0) * 2 * math.pi / period
+        async with state_lock:
+            targets.update(
+                {
+                    "xM": r * math.cos(t),
+                    "zM": r * math.sin(t),
+                    "yawDeg": math.degrees(t) % 360,
+                }
+            )
 
 
 @app.on_event("startup")
 async def start_tasks():
     asyncio.create_task(broadcaster())
     asyncio.create_task(motion_loop())
+    asyncio.create_task(spin_origin())
     # asyncio.create_task(demo_motion())
 
 
@@ -195,6 +356,7 @@ async def start_tasks():
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    global hold_xyz_mm, state, _base_x0, _base_z0
     await ws.accept()
     clients.add(ws)
     try:
@@ -203,7 +365,18 @@ async def ws_endpoint(ws: WebSocket):
             msg = json.loads(raw)
             async with state_lock:
                 if "xyz" in msg:
-                    targets.update(ik_xyz_to_joints(**msg["xyz"]))
+                    hold_xyz_mm = (
+                        msg["xyz"]["x_mm"],
+                        msg["xyz"]["y_mm"],
+                        msg["xyz"]["z_mm"],
+                    )
+                    _base_x0, _base_z0 = state.xM, state.zM
+                    targets.update(
+                        world_xyz_to_joints(**msg["xyz"], current_state=state)
+                    )
+                elif any(k in msg for k in JOINT_KEYS):
+                    hold_xyz_mm = None
+                    targets.update({k: msg[k] for k in JOINT_KEYS if k in msg})
                 else:
                     targets.update(msg)
     except WebSocketDisconnect:

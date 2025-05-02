@@ -20,19 +20,33 @@ import { MathUtils, GridHelper, AxesHelper, Group } from 'three';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
-export interface CraneState {
+export interface JointState {
   swingDeg:   number; // J1 – base rotation about Z
   liftMm:   number; // J2 – vertical slide
   elbowDeg: number; // J3 – elbow pitch
   wristDeg: number; // J4 – wrist pitch
   gripMm?:  number; // gripper opening (mm)
 }
+
+export interface RootPose {
+  xM: number;            // translation in world X (forward)
+  yM: number;            // translation in world Y (up)
+  zM: number;            // translation in world Z (left)
+  yawDeg: number;         // rotation about +Y (↻ about vertical axis)
+}
+
+export interface CraneState extends JointState, RootPose {}
+
+
  type Props = {
   state: CraneState
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+
 export default function CraneCanvas({state}: Props ) {
+  const { xM, yM, zM, yawDeg } = state;
+
   return (
     <div className="relative w-full h-full">
       <Canvas camera={{ position: [6, 4, 8], fov: 45 }} className="!absolute inset-0">
@@ -47,7 +61,15 @@ export default function CraneCanvas({state}: Props ) {
         <ambientLight intensity={0.6} />
         <directionalLight position={[5, 10, 2]} intensity={0.8} />
         <OrbitControls makeDefault />
-        <CraneModel state={state} />
+         {/* ── moving base visualisation ── */}
+        <group
+          position={[xM, yM, zM]}
+          rotation={[0, yawDeg * MathUtils.DEG2RAD, 0]}
+        >
+          <primitive object={new AxesHelper(1)} />          {/* local axes, in colour */}
+          <CraneModel state={state} />
+        </group>
+
         {/* ground */}
         <mesh rotation-x={-Math.PI / 2}>
           <planeGeometry args={[10, 10]} />
@@ -119,8 +141,8 @@ function CraneModel({ state }: { state: CraneState }) {
   const root = useRef<Group>(null!);   // swing
   const lift = useRef<Group>(null!);   // prismatic slide
   const elbow = useRef<Group>(null!); 
-  const wrist = useRef<Group>(null!);  // elbow pitch
-  const gripper = useRef<Group>(null!);  // wrist pitch
+  const wrist = useRef<Group>(null!);  // elbow
+  const gripper = useRef<Group>(null!);  // wrist
 
   useFrame(() => {
     const { swingDeg, liftMm, elbowDeg, wristDeg } = state;

@@ -4,6 +4,7 @@ import { CraneState } from '@/components/CraneCanvas';
 
 const DEFAULT: CraneState = {
   swingDeg: 0, liftMm: 0, elbowDeg: 0, wristDeg: 0, gripMm: 70,
+  xM: 0, yM: 0, zM: 0, yawDeg: 0,
 };
 
 export function useCraneTelemetry(url = 'ws://localhost:8000/ws') {

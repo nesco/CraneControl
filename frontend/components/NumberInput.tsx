@@ -19,6 +19,8 @@ export default function NumberInput({name, label, binding, className = '', ...re
           id={name} 
           name={name} 
           type="number" 
+          inputMode="url"
+          pattern="-?[0-9]+"
           step="any"
           className={`
           mt-1 block w-full rounded-md border-gray-300 shadow-sm
