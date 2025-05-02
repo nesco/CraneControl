@@ -13,6 +13,8 @@ A two-part system:
 cd backend && uv venv .venv --python 3.12 && source .venv/bin/activate && uv sync && uv run uvicorn crane_server:app --reload
 # frontend
 cd frontend && npm install && npm run dev
+```
+
 
 ## Questions
 - Bonus: How can you deal with an origin sensor is noisy or has some jitter? Or oscillates slowly like it’s on a wavy ocean? Or if the data is lagging in time?
