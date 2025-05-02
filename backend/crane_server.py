@@ -1,3 +1,7 @@
+"""
+FastAPI server which simulates a Monumental.co crane sending data, and receiving commands through telemetry
+"""
+
 import asyncio
 import json
 import math
@@ -273,8 +277,6 @@ def world_xyz_to_joints(x_mm, y_mm, z_mm, current_state: CraneState):
 
     return best
 
-
-# --- Make sure world_xyz_to_joints calls the corrected function ---
 
 ### Async functions
 

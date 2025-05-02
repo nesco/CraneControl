@@ -1,15 +1,10 @@
 /*
  * CraneCanvas.tsx – v2  ·  R‑P‑R‑R chain matching Monumental’s schematic
  * --------------------------------------------------------------------------
- *  J1  swingDeg  – swing rotation (deg)
- *  J2  liftMm    – prismatic lift (mm)
- *  J3  elbowDeg  – elbow pitch (deg)
- *  J4  wristDeg  – wrist pitch (deg)
- *  g   gripMm    – gripper opening (mm)
- * --------------------------------------------------------------------------
  *  Dependencies:
  *    npm i three @react-three/fiber @react-three/drei
  */
+
 'use client';
 
 import { Canvas, useFrame } from '@react-three/fiber';

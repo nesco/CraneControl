@@ -2,8 +2,7 @@
  * app/page.tsx – Home route hosting the CraneCanvas in a Next.js 13/14 App Router project
  * --------------------------------------------------------------------------
  * This page keeps a local `CraneState` in React state so you can see the arm
- * move without wiring up the real WebSocket yet. Replace the demo `useEffect`
- * with your telemetry hook when ready.
+ * move without wiring up the real WebSocket yet.
  */
 'use client';
 
